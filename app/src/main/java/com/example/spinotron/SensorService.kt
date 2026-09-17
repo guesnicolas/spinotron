@@ -1,48 +1,55 @@
 package com.example.spinotron
 
-import android.app.*
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
 import android.content.Intent
-import android.hardware.*
-import android.os.IBinder
-import androidx.core.app.NotificationCompat
-import kotlin.math.*
 import android.content.pm.ServiceInfo
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.os.IBinder
+import android.os.SystemClock
+import androidx.core.app.NotificationCompat
+import kotlin.math.PI
+import kotlin.math.abs
 
-data class Vec3(val x: Double, val y: Double, val z: Double) {
-    operator fun plus(v: Vec3) = Vec3(x + v.x, y + v.y, z + v.z)
-    operator fun minus(v: Vec3) = Vec3(x - v.x, y - v.y, z - v.z)
-    operator fun times(s: Double) = Vec3(x * s, y * s, z * s)
-    infix fun dot(v: Vec3) = x * v.x + y * v.y + z * v.z
-    infix fun cross(v: Vec3) = Vec3(
-        y * v.z - z * v.y,
-        z * v.x - x * v.z,
-        x * v.y - y * v.x
-    )
-    fun norm() = sqrt(x * x + y * y + z * z)
-    fun normalize() = this * (1.0 / (norm() + 1e-9))
-}
-
+/**
+ * Suit l'azimut du téléphone via le capteur fusionné TYPE_ROTATION_VECTOR (gyroscope +
+ * accéléromètre + magnétomètre, combinés par le firmware). Contrairement à un calcul basé
+ * uniquement sur gravité + champ magnétique, ce capteur reste stable quand le champ magnétique
+ * est perturbé (métro, structures métalliques...) : le gyroscope porte le signal à court terme
+ * pendant que le magnétomètre ne sert qu'à corriger la dérive à long terme.
+ */
 class SensorService : Service(), SensorEventListener {
 
     private lateinit var sensorManager: SensorManager
-    private var gravity = Vec3(0.0, 0.0, 9.8)
+
+    private val rotationMatrix = FloatArray(9)
+    private val orientation = FloatArray(3)
     private var lastAngle: Double? = null
-    
+
+    private var runStartElapsedRealtime = 0L
+    private var pausedElapsedMs = 0L
+
     private var lastHistoryUpdateMs = 0L
-    private var angleAtLastMinute = 0.0
+    private var angleAtLastHistoryPoint = 0.0
 
     override fun onCreate() {
         super.onCreate()
-        startForeground(1, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH)
+        startForeground(NOTIFICATION_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH)
         sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
-        
-        // On utilise TYPE_GRAVITY au lieu de ACCELEROMETER pour filtrer les mouvements brusques
-        val samplingPeriodUs = 20_000 // 50Hz
-        
-        sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)?.let {
-            sensorManager.registerListener(this, it, samplingPeriodUs)
-        }
-        sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)?.let {
+
+        pausedElapsedMs = SpinRepository.state.value.elapsedMs
+        runStartElapsedRealtime = SystemClock.elapsedRealtime()
+        lastHistoryUpdateMs = 0L
+        angleAtLastHistoryPoint = SpinRepository.state.value.totalAngleRad
+        SpinRepository.setRunning(true)
+
+        val samplingPeriodUs = 20_000 // ~50 Hz
+        sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)?.let {
             sensorManager.registerListener(this, it, samplingPeriodUs)
         }
     }
@@ -50,65 +57,46 @@ class SensorService : Service(), SensorEventListener {
     override fun onDestroy() {
         super.onDestroy()
         sensorManager.unregisterListener(this)
+        SpinRepository.setRunning(false)
+        lastAngle = null
     }
 
     override fun onSensorChanged(event: SensorEvent) {
-        when (event.sensor.type) {
-            Sensor.TYPE_GRAVITY -> {
-                gravity = Vec3(event.values[0].toDouble(), event.values[1].toDouble(), event.values[2].toDouble())
-            }
-            Sensor.TYPE_MAGNETIC_FIELD -> {
-                if (!SensorState.isRunning.value) {
-                    lastAngle = null
-                    return
-                }
+        if (event.sensor.type != Sensor.TYPE_ROTATION_VECTOR) return
 
-                val m = Vec3(event.values[0].toDouble(), event.values[1].toDouble(), event.values[2].toDouble())
-                
-                // --- CALCUL DE L'ORIENTATION ROBUSTE ---
-                // 1. Le vecteur "Bas" (déjà donné par gravity)
-                val down = gravity.normalize()
-                
-                // 2. Le vecteur "Est" (perpendiculaire au plan défini par la gravité et le champ magnétique)
-                val east = (m cross down).normalize()
-                
-                // 3. Le vecteur "Nord" (dans le plan horizontal, pointant vers le pôle magnétique)
-                val north = down cross east
-                
-                // L'angle du téléphone (Azimut) est l'angle de son axe Y (ou X) dans la base (Nord, Est)
-                // Ici on calcule l'angle absolu du téléphone par rapport au Nord magnétique
-                // On utilise atan2(composante_Est, composante_Nord)
-                val currentAngle = atan2(east.x, north.x) 
+        SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+        SensorManager.getOrientation(rotationMatrix, orientation)
+        val currentAngle = orientation[0].toDouble() // azimut par rapport au Nord magnétique, en radians
 
-                lastAngle?.let {
-                    var dtheta = currentAngle - it
-                    
-                    // Gestion du passage de -PI à +PI
-                    while (dtheta > PI) dtheta -= 2 * PI
-                    while (dtheta < -PI) dtheta += 2 * PI
-                    
-                    // Filtrage des petits bruits magnétiques
-                    if (abs(dtheta) < PI / 2) {
-                        SensorState.totalAngle.value += dtheta
-                        SensorState.currentDtheta.value = dtheta
-                    }
-                }
-                
-                lastAngle = currentAngle
-                SensorState.currentAngle.value = currentAngle
-                
-                // --- MISE À JOUR DE L'HISTORIQUE TOUTES LES 10 SECONDES ---
-                val now = System.currentTimeMillis()
-                if (lastHistoryUpdateMs == 0L) {
-                    lastHistoryUpdateMs = now
-                    angleAtLastMinute = SensorState.totalAngle.value
-                } else if (now - lastHistoryUpdateMs >= 10_000) {
-                    val turnsInInterval = (SensorState.totalAngle.value - angleAtLastMinute) / (2 * PI)
-                    SensorState.turnsHistory.add(turnsInInterval)
-                    angleAtLastMinute = SensorState.totalAngle.value
-                    lastHistoryUpdateMs = now
-                }
+        lastAngle?.let { previous ->
+            var dtheta = currentAngle - previous
+            while (dtheta > PI) dtheta -= 2 * PI
+            while (dtheta < -PI) dtheta += 2 * PI
+
+            // Écarte les sauts improbables (bruit/ré-étalonnage) : à 50 Hz, une vraie rotation
+            // ne peut pas dépasser 90° entre deux échantillons sans que le téléphone tourne à
+            // plus de 12 tours/seconde.
+            if (abs(dtheta) < PI / 2) {
+                SpinRepository.addRotation(dtheta, currentAngle)
+            } else {
+                SpinRepository.setCurrentAngle(currentAngle)
             }
+        } ?: SpinRepository.setCurrentAngle(currentAngle)
+
+        lastAngle = currentAngle
+
+        val elapsed = pausedElapsedMs + (SystemClock.elapsedRealtime() - runStartElapsedRealtime)
+        SpinRepository.tick(elapsed)
+
+        val now = SystemClock.elapsedRealtime()
+        if (lastHistoryUpdateMs == 0L) {
+            lastHistoryUpdateMs = now
+        } else if (now - lastHistoryUpdateMs >= HISTORY_INTERVAL_MS) {
+            val total = SpinRepository.state.value.totalAngleRad
+            val turnsInWindow = (total - angleAtLastHistoryPoint) / (2 * PI)
+            SpinRepository.pushHistoryPoint(turnsInWindow)
+            angleAtLastHistoryPoint = total
+            lastHistoryUpdateMs = now
         }
     }
 
@@ -116,13 +104,17 @@ class SensorService : Service(), SensorEventListener {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun buildNotification(): Notification {
-        val channelId = "spinotron"
-        val chan = NotificationChannel(channelId, "Spinotron", NotificationManager.IMPORTANCE_LOW)
+        val chan = NotificationChannel(CHANNEL_ID, "Spinotron", NotificationManager.IMPORTANCE_LOW)
         getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
-        return NotificationCompat.Builder(this, channelId)
+        return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Spinotron")
-            .setContentText("Calcul des rotations en cours…")
+            .setContentText("Comptage des rotations en cours…")
             .setSmallIcon(android.R.drawable.ic_menu_compass)
             .build()
+    }
+
+    private companion object {
+        const val CHANNEL_ID = "spinotron"
+        const val NOTIFICATION_ID = 1
     }
 }
