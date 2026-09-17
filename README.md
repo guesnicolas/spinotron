@@ -1,7 +1,7 @@
  # Spinotron
 
-Android app that counts rotations using the magnetometer and accelerometer.
-Press **Démarrer** and put your phone in your pocket — the app tracks cumulative turns in real time, even with the screen locked.
+Android app that counts how many turns you do during your day using the magnetometer and accelerometer.
+Press **Démarrer** and put your phone in your pocket — the app tracks cumulative turns in real time.
 
 ## Features
 - Rotation counter (fractional turns)
