@@ -34,9 +34,6 @@ class SensorService : Service(), SensorEventListener {
     private var runStartElapsedRealtime = 0L
     private var pausedElapsedMs = 0L
 
-    private var lastHistoryUpdateMs = 0L
-    private var angleAtLastHistoryPoint = 0.0
-
     override fun onCreate() {
         super.onCreate()
         startForeground(NOTIFICATION_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH)
@@ -44,8 +41,6 @@ class SensorService : Service(), SensorEventListener {
 
         pausedElapsedMs = SpinRepository.state.value.elapsedMs
         runStartElapsedRealtime = SystemClock.elapsedRealtime()
-        lastHistoryUpdateMs = 0L
-        angleAtLastHistoryPoint = SpinRepository.state.value.totalAngleRad
         SpinRepository.setRunning(true)
 
         val samplingPeriodUs = 20_000 // ~50 Hz
@@ -87,17 +82,6 @@ class SensorService : Service(), SensorEventListener {
 
         val elapsed = pausedElapsedMs + (SystemClock.elapsedRealtime() - runStartElapsedRealtime)
         SpinRepository.tick(elapsed)
-
-        val now = SystemClock.elapsedRealtime()
-        if (lastHistoryUpdateMs == 0L) {
-            lastHistoryUpdateMs = now
-        } else if (now - lastHistoryUpdateMs >= HISTORY_INTERVAL_MS) {
-            val total = SpinRepository.state.value.totalAngleRad
-            val turnsInWindow = (total - angleAtLastHistoryPoint) / (2 * PI)
-            SpinRepository.pushHistoryPoint(turnsInWindow)
-            angleAtLastHistoryPoint = total
-            lastHistoryUpdateMs = now
-        }
     }
 
     override fun onAccuracyChanged(sensor: Sensor, accuracy: Int) {}

@@ -5,8 +5,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 
-/** Fenêtre d'agrégation de l'historique, en millisecondes. */
-const val HISTORY_INTERVAL_MS = 10_000L
+/** Nombre de points conservés dans le graphique avant qu'il ne se recompresse. */
+private const val MAX_TREND_POINTS = 200
+private const val INITIAL_SAMPLE_INTERVAL_MS = 250L
+
+data class TrendPoint(val elapsedMs: Long, val totalTurns: Double)
 
 data class SpinUiState(
     val totalAngleRad: Double = 0.0,
@@ -14,7 +17,7 @@ data class SpinUiState(
     val currentDeltaRad: Double = 0.0,
     val isRunning: Boolean = false,
     val elapsedMs: Long = 0L,
-    val turnsHistory: List<Double> = emptyList(),
+    val trend: List<TrendPoint> = emptyList(),
 )
 
 /**
@@ -25,6 +28,12 @@ data class SpinUiState(
 object SpinRepository {
     private val _state = MutableStateFlow(SpinUiState())
     val state: StateFlow<SpinUiState> = _state.asStateFlow()
+
+    // Intervalle d'échantillonnage courant du graphique : il double à chaque fois que le
+    // nombre de points dépasse MAX_TREND_POINTS, pour que le graphe couvre toute la durée
+    // de l'enregistrement avec un nombre de points borné (il "se compresse" avec le temps).
+    private var sampleIntervalMs = INITIAL_SAMPLE_INTERVAL_MS
+    private var lastSampledAtMs = -1L
 
     fun setRunning(running: Boolean) {
         _state.update { it.copy(isRunning = running) }
@@ -46,13 +55,26 @@ object SpinRepository {
 
     fun tick(elapsedMs: Long) {
         _state.update { it.copy(elapsedMs = elapsedMs) }
+        sampleTrend(elapsedMs)
     }
 
-    fun pushHistoryPoint(turnsInWindow: Double) {
-        _state.update { it.copy(turnsHistory = it.turnsHistory + turnsInWindow) }
+    private fun sampleTrend(elapsedMs: Long) {
+        if (lastSampledAtMs >= 0 && elapsedMs - lastSampledAtMs < sampleIntervalMs) return
+        lastSampledAtMs = elapsedMs
+
+        _state.update {
+            var points = it.trend + TrendPoint(elapsedMs, it.totalAngleRad / (2 * Math.PI))
+            if (points.size > MAX_TREND_POINTS) {
+                points = points.filterIndexed { index, _ -> index % 2 == 0 }
+                sampleIntervalMs *= 2
+            }
+            it.copy(trend = points)
+        }
     }
 
     fun reset() {
+        sampleIntervalMs = INITIAL_SAMPLE_INTERVAL_MS
+        lastSampledAtMs = -1L
         _state.value = SpinUiState()
     }
 }
