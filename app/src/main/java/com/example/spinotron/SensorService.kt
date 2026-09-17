@@ -10,6 +10,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
@@ -36,7 +37,13 @@ class SensorService : Service(), SensorEventListener {
 
     override fun onCreate() {
         super.onCreate()
-        startForeground(NOTIFICATION_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH)
+        // La variante à 3 arguments (avec le type de service) n'existe qu'à partir d'Android 10
+        // (API 29). L'appeler sur un appareil plus ancien fait planter le service au démarrage.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH)
+        } else {
+            startForeground(NOTIFICATION_ID, buildNotification())
+        }
         sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
 
         pausedElapsedMs = SpinRepository.state.value.elapsedMs
@@ -88,8 +95,12 @@ class SensorService : Service(), SensorEventListener {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun buildNotification(): Notification {
-        val chan = NotificationChannel(CHANNEL_ID, "Spinotron", NotificationManager.IMPORTANCE_LOW)
-        getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
+        // Les channels de notification n'existent qu'à partir d'Android 8 (API 26) ;
+        // sur un appareil plus ancien, NotificationCompat.Builder ignore juste le channel id.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val chan = NotificationChannel(CHANNEL_ID, "Spinotron", NotificationManager.IMPORTANCE_LOW)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
+        }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Spinotron")
             .setContentText("Comptage des rotations en cours…")
