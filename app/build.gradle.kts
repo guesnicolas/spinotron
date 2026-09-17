@@ -25,6 +25,10 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Pas de clé de release dédiée pour ce projet : on signe avec la clé de debug
+            // pour obtenir un APK installable, optimisé (R8 + shrink), sans publier sur le
+            // Play Store. À remplacer par un vrai signingConfig si une distribution "prod" est envisagée.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {
