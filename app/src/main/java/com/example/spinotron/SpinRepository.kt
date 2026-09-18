@@ -44,18 +44,23 @@ object SpinRepository {
         _state.update { it.copy(isRunning = false, sensorUnavailable = true) }
     }
 
-    fun addRotation(deltaRad: Double, currentAngleRad: Double) {
+    fun addRotation(deltaRad: Double) {
         _state.update {
+            val newTotal = it.totalAngleRad + deltaRad
             it.copy(
-                totalAngleRad = it.totalAngleRad + deltaRad,
+                totalAngleRad = newTotal,
                 currentDeltaRad = deltaRad,
-                currentAngleRad = currentAngleRad,
+                currentAngleRad = wrapToPi(newTotal),
             )
         }
     }
 
-    fun setCurrentAngle(currentAngleRad: Double) {
-        _state.update { it.copy(currentAngleRad = currentAngleRad) }
+    /** Ramène un angle en radians dans (-π, π], pour l'affichage du cap depuis le début. */
+    private fun wrapToPi(rad: Double): Double {
+        var a = rad % (2 * Math.PI)
+        if (a > Math.PI) a -= 2 * Math.PI
+        if (a <= -Math.PI) a += 2 * Math.PI
+        return a
     }
 
     fun tick(elapsedMs: Long) {
