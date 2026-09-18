@@ -18,6 +18,7 @@ data class SpinUiState(
     val isRunning: Boolean = false,
     val elapsedMs: Long = 0L,
     val trend: List<TrendPoint> = emptyList(),
+    val sensorUnavailable: Boolean = false,
 )
 
 /**
@@ -37,6 +38,10 @@ object SpinRepository {
 
     fun setRunning(running: Boolean) {
         _state.update { it.copy(isRunning = running) }
+    }
+
+    fun setSensorUnavailable() {
+        _state.update { it.copy(isRunning = false, sensorUnavailable = true) }
     }
 
     fun addRotation(deltaRad: Double, currentAngleRad: Double) {

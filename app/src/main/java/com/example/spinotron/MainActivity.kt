@@ -88,6 +88,16 @@ private fun SpinScreen(onToggleRunning: () -> Unit, onReset: () -> Unit) {
                 Text("Reset")
             }
         }
+
+        if (state.sensorUnavailable) {
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                "Capteur de rotation indisponible sur cet appareil\n(magnétomètre ou gyroscope manquant)",
+                fontSize = 14.sp,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+
         Spacer(modifier = Modifier.height(20.dp))
         Text("θ = ${"%.1f".format(Math.toDegrees(state.currentAngleRad))}°", fontSize = 20.sp)
         Text("dθ = ${"%.2f".format(Math.toDegrees(state.currentDeltaRad))}°", fontSize = 20.sp)

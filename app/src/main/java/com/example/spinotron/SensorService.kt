@@ -46,14 +46,22 @@ class SensorService : Service(), SensorEventListener {
         }
         sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
 
+        val rotationVectorSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        if (rotationVectorSensor == null) {
+            // Ce capteur virtuel a besoin d'un magnétomètre (et idéalement d'un gyroscope) ;
+            // certains téléphones d'entrée de gamme n'embarquent qu'un accéléromètre, auquel
+            // cas mesurer une rotation autour de l'axe vertical est physiquement impossible.
+            SpinRepository.setSensorUnavailable()
+            stopSelf()
+            return
+        }
+
         pausedElapsedMs = SpinRepository.state.value.elapsedMs
         runStartElapsedRealtime = SystemClock.elapsedRealtime()
         SpinRepository.setRunning(true)
 
         val samplingPeriodUs = 20_000 // ~50 Hz
-        sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)?.let {
-            sensorManager.registerListener(this, it, samplingPeriodUs)
-        }
+        sensorManager.registerListener(this, rotationVectorSensor, samplingPeriodUs)
     }
 
     override fun onDestroy() {
