@@ -14,7 +14,9 @@ import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
+import kotlin.math.PI
 import kotlin.math.abs
+import kotlin.math.atan2
 
 /**
  * Suit la rotation du téléphone via le capteur fusionné TYPE_ROTATION_VECTOR (gyroscope +
@@ -23,21 +25,35 @@ import kotlin.math.abs
  * est perturbé (métro, structures métalliques...) : le gyroscope porte le signal à court terme
  * pendant que le magnétomètre ne sert qu'à corriger la dérive à long terme.
  *
- * Le comptage n'utilise PAS l'azimut renvoyé par SensorManager.getOrientation() : cette
- * décomposition en angles d'Euler (azimuth/pitch/roll) a un point de singularité ("gimbal
- * lock") quand le téléphone est proche de la verticale (pitch ≈ 90°, typiquement en poche),
- * où de petits mouvements réels produisent des sauts d'azimut énormes. On calcule à la place
- * la rotation incrémentale directement entre deux matrices de rotation successives
- * (ΔR = Rₜ₋₁ᵀ · Rₜ, repère du téléphone), puis on la projette sur l'axe vertical du monde —
- * cet axe est directement lisible dans R (sa 3e ligne), pas besoin d'un capteur gravité séparé.
- * Cette projection n'a pas de singularité liée à l'inclinaison du téléphone.
+ * Le nombre de tours est défini comme la classe d'homotopie de l'orientation relative au
+ * départ, dans le sous-ensemble de SO(3) où la personne n'est pas tête en bas. Soit
+ * M = R·R₀ᵀ la rotation subie depuis l'appui sur "Démarrer" et u = M·ẑ l'image de la
+ * verticale initiale : tant que u reste dans l'hémisphère haut, M vit dans
+ * U = {M : (M·ẑ)·ẑ > 0}. La fibration SO(3) → S² étant triviale au-dessus d'un hémisphère
+ * (contractile), U ≅ D² × S¹, donc π₁(U) = ℤ — et cet entier est exactement le nombre de
+ * tours. On le lit en décomposant M = S(u)·R_z(ψ), où S(u) est la rotation d'arc minimal
+ * ẑ → u (décomposition swing/twist) : ψ est la coordonnée S¹ de la trivialisation, et son
+ * déroulement continu compte les tours.
+ *
+ * Deux propriétés que n'avaient pas les approches précédentes :
+ *  - ψ est une fonction d'état de M, pas une intégrale de chemin : un cycle de ballottement
+ *    qui ramène le téléphone à la même orientation ne laisse aucune dérive résiduelle
+ *    (l'intégrale de ω·ẑ, elle, accumulait l'angle solide balayé — de l'ordre d'un tour
+ *    fantôme pour quelques minutes de marche).
+ *  - la seule singularité est u = −ẑ, c'est-à-dire tête en bas, à 180° du régime d'usage,
+ *    au lieu du gimbal lock de getOrientation() qui tombe à 90° (téléphone vertical en poche).
  */
 class SensorService : Service(), SensorEventListener {
 
     private lateinit var sensorManager: SensorManager
 
     private val currentRotationMatrix = FloatArray(9)
-    private var previousRotationMatrix: FloatArray? = null
+
+    // Axes de référence capturés au démarrage, exprimés dans le repère du téléphone :
+    // la verticale du monde (b = R₀ᵀ·ẑ) et une direction horizontale (f = R₀ᵀ·x̂).
+    private var referenceUp: DoubleArray? = null
+    private val referenceForward = DoubleArray(3)
+    private var lastTwistAngle: Double? = null
 
     private var runStartElapsedRealtime = 0L
     private var pausedElapsedMs = 0L
@@ -75,7 +91,8 @@ class SensorService : Service(), SensorEventListener {
         super.onDestroy()
         sensorManager.unregisterListener(this)
         SpinRepository.setRunning(false)
-        previousRotationMatrix = null
+        referenceUp = null
+        lastTwistAngle = null
     }
 
     override fun onSensorChanged(event: SensorEvent) {
@@ -83,50 +100,77 @@ class SensorService : Service(), SensorEventListener {
 
         SensorManager.getRotationMatrixFromVector(currentRotationMatrix, event.values)
 
-        previousRotationMatrix?.let { prev ->
-            val dtheta = incrementalYawRad(prev, currentRotationMatrix)
+        if (referenceUp == null) captureReferenceFrame()
 
-            // Écarte les sauts improbables (bruit/ré-étalonnage) : à 50 Hz, une vraie rotation
-            // ne peut pas dépasser 90° entre deux échantillons sans que le téléphone tourne à
-            // plus de 12 tours/seconde.
-            if (abs(dtheta) < Math.PI / 2) {
-                SpinRepository.addRotation(dtheta)
+        val twist = twistAngleRad()
+        if (twist != null) {
+            lastTwistAngle?.let { previous ->
+                var dpsi = twist - previous
+                while (dpsi > PI) dpsi -= 2 * PI
+                while (dpsi < -PI) dpsi += 2 * PI
+
+                // Écarte les sauts improbables (bruit/ré-étalonnage) : à 50 Hz, une vraie
+                // rotation ne peut pas dépasser 90° entre deux échantillons sans que le
+                // téléphone tourne à plus de 12 tours/seconde.
+                if (abs(dpsi) < PI / 2) {
+                    SpinRepository.addRotation(dpsi)
+                }
             }
+            lastTwistAngle = twist
         }
-
-        previousRotationMatrix = currentRotationMatrix.copyOf()
 
         val elapsed = pausedElapsedMs + (SystemClock.elapsedRealtime() - runStartElapsedRealtime)
         SpinRepository.tick(elapsed)
     }
 
     /**
-     * Rotation autour de l'axe vertical du monde entre deux orientations successives du
-     * téléphone, en radians. Repose uniquement sur les matrices de rotation (élément de
-     * SO(3)) : pas de décomposition en angles d'Euler, donc pas de gimbal lock.
+     * Mémorise l'orientation de départ R₀ sous la forme de deux axes du monde ramenés dans le
+     * repère du téléphone : b = R₀ᵀ·ẑ (3e ligne de R₀) et f = R₀ᵀ·x̂ (1re ligne). Ils sont
+     * orthonormés par construction, et donnent ψ = 0 au premier échantillon.
      */
-    private fun incrementalYawRad(prev: FloatArray, curr: FloatArray): Double {
-        // ΔR (repère téléphone) = prevᵀ · curr. Pour un petit pas de temps, ΔR ≈ I + [ω]×,
-        // donc sa partie antisymétrique donne directement le vecteur rotation incrémental
-        // exprimé dans le repère du téléphone — l'équivalent de ce que mesurerait un
-        // gyroscope physique intégré sur cet intervalle, mais tiré de l'orientation fusionnée.
-        fun dR(i: Int, j: Int): Float {
-            var sum = 0f
-            for (k in 0 until 3) sum += prev[k * 3 + i] * curr[k * 3 + j]
-            return sum
-        }
+    private fun captureReferenceFrame() {
+        referenceUp = doubleArrayOf(
+            currentRotationMatrix[6].toDouble(),
+            currentRotationMatrix[7].toDouble(),
+            currentRotationMatrix[8].toDouble(),
+        )
+        referenceForward[0] = currentRotationMatrix[0].toDouble()
+        referenceForward[1] = currentRotationMatrix[1].toDouble()
+        referenceForward[2] = currentRotationMatrix[2].toDouble()
+    }
 
-        val rx = (dR(2, 1) - dR(1, 2)) / 2f
-        val ry = (dR(0, 2) - dR(2, 0)) / 2f
-        val rz = (dR(1, 0) - dR(0, 1)) / 2f
+    /**
+     * Angle de twist ψ autour de la verticale, pour M = R·R₀ᵀ décomposé en S(u)·R_z(ψ).
+     * Renvoie null dans la configuration dégénérée "tête en bas", où le nombre de tours
+     * n'est plus défini (u = −ẑ, sortie de U).
+     */
+    private fun twistAngleRad(): Double? {
+        val b = referenceUp ?: return null
+        val f = referenceForward
+        val r = currentRotationMatrix
 
-        // Axe vertical du monde (Z, "haut") exprimé dans le repère du téléphone : c'est la
-        // 3e ligne de la matrice de rotation, disponible directement, sans capteur gravité.
-        val upX = curr[6]
-        val upY = curr[7]
-        val upZ = curr[8]
+        // u = R·b : image de la verticale initiale. w = R·f : la direction horizontale de
+        // référence. Les deux sont exprimées dans le repère du monde.
+        val ux = r[0] * b[0] + r[1] * b[1] + r[2] * b[2]
+        val uy = r[3] * b[0] + r[4] * b[1] + r[5] * b[2]
+        val uz = r[6] * b[0] + r[7] * b[1] + r[8] * b[2]
 
-        return (rx * upX + ry * upY + rz * upZ).toDouble()
+        val wx = r[0] * f[0] + r[1] * f[1] + r[2] * f[2]
+        val wy = r[3] * f[0] + r[4] * f[1] + r[5] * f[2]
+        val wz = r[6] * f[0] + r[7] * f[1] + r[8] * f[2]
+
+        if (1.0 + uz < 1e-3) return null
+
+        // h = S(u)⁻¹·w, ramené dans le plan horizontal. Rodrigues autour de v = u × ẑ, réécrit
+        // avec 1/(1+u_z) au lieu de 1/sin² pour rester lisse quand u est proche de ẑ — qui est
+        // justement le cas nominal.
+        val vx = uy
+        val vy = -ux
+        val k = (vx * wx + vy * wy) / (1.0 + uz)
+
+        val hx = uz * wx + vy * wz + vx * k
+        val hy = uz * wy - vx * wz + vy * k
+        return atan2(hy, hx)
     }
 
     override fun onAccuracyChanged(sensor: Sensor, accuracy: Int) {}
